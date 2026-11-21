@@ -1,4 +1,4 @@
--- BeamNG.drive Vulkan VRAM Leak Fix (vulkanVramFix)
+-- BeamNG.drive Vulkan VRAM Leak Fix (vulkanVramFix v1.1.0)
 -- Non-destructive user-folder extension (does not alter original game files or user graphics settings).
 -- Works on AMD, NVIDIA, and Intel GPUs under Vulkan; stays inactive on DirectX 11 / DirectX 12.
 --
@@ -8,8 +8,12 @@
 --   1. $gfx::transientPoolBudgetMB defaults to 1536 MB (0x600), hoarding transient render targets.
 --   2. GFXVkDevice::endScene never trims retired 16 MB staging slabs and retains large per-bucket
 --      dynamic VRAM buffer pools and internal caches until GFXVkDevice::waitIdle() runs.
---   3. GFXVkDevice::vtable[+0x108], BeamNG's built-in VMA heap pressure flusher that triggers
---      waitIdle(), is only called from GuiCanvas::repaintUIThrottled() (loading screens only).
+--   3. GFXVkDevice::vtable[+0x108] (0x140F10260), BeamNG's built-in VMA heap pressure flusher
+--      (checkVmaHeapBudgets(0.85f) @ 0x140F0ED80 -> waitIdle() @ 0x140F1A710), is only called from
+--      GuiCanvas::repaintUIThrottled() (loading screens only in vanilla Lua).
+--   4. v1.1.0 VMA Budget Alignment: GFXVkDevice::getMemoryInfo (0x140EFBA40) reports availableBytes
+--      relative to VMA budgetBytes (budgetBytes - usageBytes), not dedicatedBytes. Triggering on
+--      usageBytes / budgetBytes >= 0.852 guarantees C++ checkVmaHeapBudgets(0.85f) fires on Tap #1.
 
 local M = {}
 
@@ -18,20 +22,22 @@ local BYTES_PER_MB = 1024 * 1024
 local BYTES_PER_GB = 1024 * 1024 * 1024
 
 local config = {
+  version = "1.1.0",
   enabled = true,
   autoFlush = true,
-  transientPoolBudgetMB = 384,   -- Vanilla default is 1536 MB
-  checkIntervalSec = 1.0,        -- Poll VRAM once per second
-  activeFlushRatio = 0.78,       -- Trigger flush during gameplay at >= 78% VRAM used
-  activeMinFreeGB = 1.60,        -- Or when free VRAM drops <= 1.60 GiB
-  pauseFlushRatio = 0.65,        -- Opportunistic flush while paused at >= 65% VRAM used
-  minReclaimedMB = 192,          -- Minimum drop to consider a flush effective
-  normalCooldownSec = 6.0,       -- Cooldown after an effective flush
-  backoffCooldownSec = 25.0,     -- Cooldown if VRAM is genuinely filled by static scene assets
+  transientPoolBudgetMB = 384,     -- Vanilla default is 1536 MB
+  checkIntervalSec = 1.0,          -- Poll VRAM once per second
+  activeVmaBudgetRatio = 0.852,    -- Aligns just above C++ checkVmaHeapBudgets(0.85f) for 1-tap flush
+  activeFallbackUsedRatio = 0.80,  -- Fallback ratio only when budgetBytes is unavailable
+  activeMinPhysicalFreeGB = 1.45,  -- Physical VRAM safety floor in GiB
+  pauseVmaBudgetRatio = 0.72,      -- Opportunistic flush while paused in menus
+  minReclaimedMB = 192,            -- Minimum drop to consider a flush effective
+  normalCooldownSec = 6.0,         -- Cooldown after an effective flush
+  backoffCooldownSec = 25.0,       -- Cooldown if VRAM is genuinely filled by static scene assets
   maxBackoffSec = 60.0,
-  burstStepSec = 0.06,           -- Must exceed repaintUIThrottled's 1/30s (0.0333s) throttle
-  maxBurstTaps = 5,              -- 5 calls guarantees internal pressure counter triggers waitIdle()
-  verifyDelaySec = 0.25,         -- Wait before measuring post-flush VRAM drop
+  burstStepSec = 0.05,             -- Must exceed repaintUIThrottled's 1/30s (0.0333s) throttle
+  maxBurstTaps = 5,                -- Fallback taps when manually/paused flushing below 0.85 budget ratio
+  verifyDelaySec = 0.20,           -- Wait before measuring post-flush VRAM drop
 }
 
 local state = {
@@ -79,35 +85,61 @@ local function readGpuMemory()
     return nil
   end
 
-  local totalBytes = nil
-  if mem.isDedicatedMemory and mem.dedicatedBytes and mem.dedicatedBytes > 0 then
-    totalBytes = mem.dedicatedBytes
-  elseif mem.dedicatedBytes and mem.dedicatedBytes > 0 then
-    totalBytes = mem.dedicatedBytes
-  elseif mem.budgetBytes and mem.budgetBytes > 0 then
-    totalBytes = mem.budgetBytes
-  elseif mem.sharedBytes and mem.sharedBytes > 0 then
-    totalBytes = mem.sharedBytes
-  end
+  local dedicatedBytes = (type(mem.dedicatedBytes) == "number" and mem.dedicatedBytes > 0) and mem.dedicatedBytes or nil
+  local budgetBytes = (type(mem.budgetBytes) == "number" and mem.budgetBytes > 0) and mem.budgetBytes or nil
+  local sharedBytes = (type(mem.sharedBytes) == "number" and mem.sharedBytes > 0) and mem.sharedBytes or nil
+  local totalBytes = dedicatedBytes or budgetBytes or sharedBytes
+  local availBytes = (type(mem.availableBytes) == "number" and mem.availableBytes >= 0) and mem.availableBytes or nil
 
-  if not totalBytes or totalBytes <= 0 or not mem.availableBytes then
+  if not totalBytes or totalBytes <= 0 then
     return nil
   end
 
-  local availableBytes = math.max(0, mem.availableBytes)
-  local usedBytes = math.max(0, totalBytes - availableBytes)
-  local usedRatio = usedBytes / totalBytes
+  local vmaUsageBytes = nil
+  if type(mem.usageBytes) == "number" and mem.usageBytes > 0 then
+    vmaUsageBytes = mem.usageBytes
+  elseif budgetBytes and availBytes then
+    -- C++ GFXVkDevice::getMemoryInfo sets availableBytes = max(0, budgetBytes - usageBytes)
+    vmaUsageBytes = math.max(0, budgetBytes - availBytes)
+  elseif availBytes then
+    vmaUsageBytes = math.max(0, totalBytes - availBytes)
+  end
+
+  if not vmaUsageBytes then
+    return nil
+  end
+
+  local hasExactBudget = (budgetBytes ~= nil)
+  local vmaBudgetBytes = budgetBytes or totalBytes
+  local vmaBudgetRatio = (vmaBudgetBytes > 0) and (vmaUsageBytes / vmaBudgetBytes) or 0
+  local physicalFreeBytes = math.max(0, totalBytes - vmaUsageBytes)
+  local physicalUsedRatio = (totalBytes > 0) and (vmaUsageBytes / totalBytes) or vmaBudgetRatio
+  local budgetFreeGB = (availBytes or math.max(0, vmaBudgetBytes - vmaUsageBytes)) / BYTES_PER_GB
 
   return {
     raw = mem,
+    hasExactBudget = hasExactBudget,
+    usedBytes = vmaUsageBytes,
+    usedMB = vmaUsageBytes / BYTES_PER_MB,
+    budgetBytes = vmaBudgetBytes,
+    budgetMB = vmaBudgetBytes / BYTES_PER_MB,
+    vmaBudgetRatio = vmaBudgetRatio,
     totalBytes = totalBytes,
-    availableBytes = availableBytes,
-    usedBytes = usedBytes,
-    usedMB = usedBytes / BYTES_PER_MB,
     totalMB = totalBytes / BYTES_PER_MB,
-    availableGB = availableBytes / BYTES_PER_GB,
-    usedRatio = usedRatio,
+    usedRatio = physicalUsedRatio,
+    availableBytes = physicalFreeBytes,
+    availableGB = physicalFreeBytes / BYTES_PER_GB,
+    budgetFreeGB = budgetFreeGB,
   }
+end
+
+local function formatMemSummary(mem)
+  if not mem then return "unavailable" end
+  return string.format(
+    "VMA %.0f / %.0f MB (%.1f%% budget) | Physical VRAM %.0f / %.0f MB (%.1f%%, free %.2f GiB)",
+    mem.usedMB, mem.budgetMB, mem.vmaBudgetRatio * 100,
+    mem.usedMB, mem.totalMB, mem.usedRatio * 100, mem.availableGB
+  )
 end
 
 local function isSafeToFlush()
@@ -141,12 +173,9 @@ local function startFlushBurst(reason, mem)
   state.lastFlushReason = reason or "threshold"
 
   log("I", logTag, string.format(
-    "Triggering Vulkan pool flush (%s): VRAM %.0f / %.0f MB (%.1f%%, free %.2f GiB)",
+    "Triggering Vulkan pool flush (%s): %s",
     state.lastFlushReason,
-    mem and mem.usedMB or 0,
-    mem and mem.totalMB or 0,
-    mem and (mem.usedRatio * 100) or 0,
-    mem and mem.availableGB or 0
+    formatMemSummary(mem)
   ))
   return true
 end
@@ -174,8 +203,10 @@ local function stepBurst(dtReal)
         state.currentBackoff = config.backoffCooldownSec
         state.cooldownTimer = config.normalCooldownSec
         log("I", logTag, string.format(
-          "Vulkan pool flush succeeded after %d tap(s): reclaimed %.0f MB (now %.0f / %.0f MB)",
-          state.burstTapsDone, reclaimed, curMem.usedMB, curMem.totalMB
+          "Vulkan pool flush succeeded after %d tap(s): reclaimed %.0f MB (now VMA %.0f / %.0f MB, %.1f%% budget | Physical %.0f / %.0f MB, free %.2f GiB)",
+          state.burstTapsDone, reclaimed,
+          curMem.usedMB, curMem.budgetMB, curMem.vmaBudgetRatio * 100,
+          curMem.usedMB, curMem.totalMB, curMem.availableGB
         ))
         return true
       end
@@ -215,16 +246,18 @@ local function stepBurst(dtReal)
       state.currentBackoff = config.backoffCooldownSec
       state.cooldownTimer = config.normalCooldownSec
       log("I", logTag, string.format(
-        "Vulkan pool flush reclaimed %.0f MB (now %.0f / %.0f MB)",
-        reclaimed, curMem.usedMB, curMem.totalMB
+        "Vulkan pool flush reclaimed %.0f MB (now VMA %.0f / %.0f MB, %.1f%% budget | Physical %.0f / %.0f MB, free %.2f GiB)",
+        reclaimed,
+        curMem.usedMB, curMem.budgetMB, curMem.vmaBudgetRatio * 100,
+        curMem.usedMB, curMem.totalMB, curMem.availableGB
       ))
     else
       state.lastReclaimedMB = reclaimed
       state.cooldownTimer = state.currentBackoff
       state.currentBackoff = math.min(config.maxBackoffSec, state.currentBackoff * 1.5)
       log("I", logTag, string.format(
-        "Vulkan pool flush reclaimed only %.0f MB (now %.0f / %.0f MB); backing off for %.0fs",
-        reclaimed, curMem and curMem.usedMB or 0, curMem and curMem.totalMB or 0, state.cooldownTimer
+        "Vulkan pool flush reclaimed only %.0f MB (now %s); backing off for %.0fs",
+        reclaimed, formatMemSummary(curMem), state.cooldownTimer
       ))
     end
     return true
@@ -259,20 +292,32 @@ local function onUpdate(dtReal, dtSim, dtRaw)
   if not state.loggedFirstSample then
     state.loggedFirstSample = true
     log("I", logTag, string.format(
-      "First GPU memory sample: used=%.0f/%.0f MB (%.1f%%), free=%.2f GiB, dedicated=%s, budget=%s",
+      "First GPU memory sample: VMA=%.0f/%.0f MB (%.1f%% budget), Physical=%.0f/%.0f MB (%.1f%%, free %.2f GiB), dedicated=%s, budget=%s, usage=%s, available=%s",
+      mem.usedMB, mem.budgetMB, mem.vmaBudgetRatio * 100,
       mem.usedMB, mem.totalMB, mem.usedRatio * 100, mem.availableGB,
-      tostring(mem.raw.dedicatedBytes), tostring(mem.raw.budgetBytes)
+      tostring(mem.raw.dedicatedBytes), tostring(mem.raw.budgetBytes),
+      tostring(mem.raw.usageBytes), tostring(mem.raw.availableBytes)
     ))
   end
 
   local isPaused = simTimeAuthority and simTimeAuthority.getPause and simTimeAuthority.getPause() or false
-  if isPaused and mem.usedRatio >= config.pauseFlushRatio then
-    startFlushBurst("paused_opportunistic", mem)
+  if isPaused then
+    local pauseRatio = mem.hasExactBudget and mem.vmaBudgetRatio or mem.usedRatio
+    if pauseRatio >= config.pauseVmaBudgetRatio then
+      startFlushBurst("paused_opportunistic", mem)
+    end
     return
   end
 
-  if mem.usedRatio >= config.activeFlushRatio or mem.availableGB <= config.activeMinFreeGB then
-    startFlushBurst("vram_pressure", mem)
+  if mem.hasExactBudget then
+    if mem.vmaBudgetRatio >= config.activeVmaBudgetRatio
+      or (mem.availableGB <= config.activeMinPhysicalFreeGB and mem.vmaBudgetRatio >= 0.85) then
+      startFlushBurst("vram_pressure", mem)
+    end
+  else
+    if mem.usedRatio >= config.activeFallbackUsedRatio or mem.availableGB <= config.activeMinPhysicalFreeGB then
+      startFlushBurst("vram_pressure", mem)
+    end
   end
 end
 
@@ -292,15 +337,19 @@ local function onClientStartMission()
 end
 
 local function onExtensionLoaded()
+  if setExtensionUnloadMode then
+    pcall(setExtensionUnloadMode, M, "manual")
+  end
   state.isVulkan = isVulkanBackend()
   applyTransientBudget()
   log("I", logTag, string.format(
-    "Loaded successfully (backend=%s, transientPoolBudgetMB=%d, autoFlush=%s, activeThreshold=%.0f%%/%.2fGiB)",
+    "Loaded v%s (backend=%s, transientPoolBudgetMB=%d, autoFlush=%s, activeVmaThreshold=%.1f%%, minPhysicalFree=%.2fGiB)",
+    config.version,
     state.isVulkan and "Vulkan" or "non-Vulkan",
     config.transientPoolBudgetMB,
     tostring(config.autoFlush),
-    config.activeFlushRatio * 100,
-    config.activeMinFreeGB
+    config.activeVmaBudgetRatio * 100,
+    config.activeMinPhysicalFreeGB
   ))
 end
 
@@ -308,7 +357,8 @@ local function status()
   local mem = readGpuMemory()
   local curBudget = VariableRegistry and VariableRegistry.get and VariableRegistry.get("$gfx::transientPoolBudgetMB")
   local info = string.format(
-    "[vulkanVramFix] vulkan=%s autoFlush=%s transientBudget=%sMB flushes=%d totalReclaimed=%.0fMB lastReclaimed=%.0fMB(%s) | VRAM=%s",
+    "[vulkanVramFix v%s] vulkan=%s autoFlush=%s transientBudget=%sMB flushes=%d totalReclaimed=%.0fMB lastReclaimed=%.0fMB(%s) | %s",
+    config.version,
     tostring(state.isVulkan),
     tostring(config.autoFlush),
     tostring(curBudget),
@@ -316,7 +366,7 @@ local function status()
     state.totalReclaimedMB,
     state.lastReclaimedMB,
     state.lastFlushReason,
-    mem and string.format("%.0f/%.0f MB (%.1f%%, free %.2f GiB)", mem.usedMB, mem.totalMB, mem.usedRatio * 100, mem.availableGB) or "unavailable"
+    formatMemSummary(mem)
   )
   log("I", logTag, info)
   print(info)
