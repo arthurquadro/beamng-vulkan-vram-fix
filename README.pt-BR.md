@@ -2,7 +2,7 @@
 
 > 🇺🇸 **English version:** [README.md](README.md)
 
-Um mod leve e não-destrutivo (`v1.2.0`) para **BeamNG.drive** que impede o **estouro progressivo de VRAM no Vulkan** e o **transbordamento para a memória compartilhada/SWAP na RAM do sistema (`nonLocalUsageBytes`)** — evitando o gargalo que derruba o FPS para ~10–14 FPS ou causa crashes `VK_ERROR_DEVICE_LOST` (quando só mudar uma opção gráfica fazia a VRAM cair temporariamente).
+Um mod leve e não-destrutivo (`v1.2.1`) para **BeamNG.drive** que impede o **estouro progressivo de VRAM no Vulkan** e o **transbordamento sob alta VRAM para o "SWAP" na RAM do sistema (`nonLocalUsageBytes`)** — evitando a saturação de VRAM que derruba o FPS para ~10–14 FPS ou gera crashes (quando só mudar uma opção gráfica fazia a VRAM cair temporariamente).
 
 - **Funciona com qualquer veículo e qualquer mapa** — não altera nenhum arquivo de veículo nem do jogo.
 - **Funciona em placas AMD, NVIDIA e Intel** (atua apenas no Vulkan; fica inativo automaticamente no DirectX 11 / DirectX 12).
@@ -21,38 +21,39 @@ A análise técnica do executável `BeamNG.drive.x64.exe` (`v0.40.6.0`) revelou 
 
 ---
 
-## Novidades da `v1.2.0` (Proteção Anti-SWAP / Memória GPU Não-Local)
+## Novidades da `v1.2.1` (Ajuste Anti-SWAP & Hotfix de Crash `VK_ERROR_DEVICE_LOST`)
 
-Uma nova etapa de engenharia reversa no binário explicou por que em mapas pesados (como **West Coast USA**) o FPS ainda podia despencar para ~14 FPS com ~2,2 GB aparentemente livres na VRAM enquanto o contador de **SWAP / Memória Compartilhada** passava de 2+ GB:
+Na `v1.2.0`, disparar limpezas incondicionalmente apenas por `SWAP >= 1032 MB` — mesmo quando a VRAM já estava no piso limpo de `55%–60%` (`~4.040 MB` em uso, `3,68–4,04 GiB` de VRAM física livres) — conflitava com o conjunto de trabalho legítimo do motor no `SWAP` (`~1.015–1.230 MB` de slabs voláteis/transfer staging retidos + `+180–450 MB` de streaming temporário). Repetir `GFXVkDevice::waitIdle()` a cada ~8 segundos com VRAM baixa interrompia uploads assíncronos de `transferAcc->queue.submit`, causando `VK_ERROR_DEVICE_LOST` (`vkGpuCrashBreadcrumbs.cpp:626`).
 
-1. **`Engine.Render.getMemoryInfo()` (`0x140EFBA40`) é cego ao `SWAP`:** a função lê apenas heaps `VK_MEMORY_HEAP_DEVICE_LOCAL_BIT` e fixa `sharedBytes = 0` em GPUs dedicadas (`0x140EFBBFA`). Já **`Engine.Platform.getGPUAdaptersInfo()`** (`0x140EFA680` → `0x140EF7C90`) consulta `VK_EXT_memory_budget` diretamente e expõe **`nonLocalUsageBytes` / `nonLocalBudgetBytes`** (`SWAP`). Além disso, em `0x140F0EEA3`, o próprio C++ `checkVmaHeapBudgets` autoriza limpeza imediata no 1º pulso sempre que `nonLocalUsageBytes >= 1 GiB`.
-2. **Callback OOM quebrado e fallback irreversível para o `SWAP`:** `vku::GenericBuffer` (`0x140EE42DD`) e `vku::GenericImage::create` (`0x14037E22C`) apontam o callback de falta de memória do VMA (`[0x142FC66F8]`, `0x140F0E415`) para uma função vazia (`0x1401035E0 = ret 0`). Quando a VRAM chega perto do orçamento ou fragmenta, o alocador desativa `DEVICE_LOCAL` e joga malhas/texturas do mapa direto no `Heap 2` (RAM via PCIe, ~15–20× mais lenta), de onde o Vulkan nunca mais consegue movê-las de volta.
-3. **Prioridades invertidas no `VK_EXT_memory_priority` + `VK_EXT_pageable_device_local_memory`:** render targets e buffers temporários de luz/sombra (incluindo `1–2 GB` parados nos pools) recebem `priority = 1.0f` (`0x14037E100` / `0x140EE417C`), enquanto a geometria e texturas vivas do mapa recebem `priority = 0.75f`. Quando o WDDM do Windows encolhe dinamicamente o orçamento (ex.: de `7.368 MB` para `6.879 MB`), o driver expulsa justamente o mapa (`0.75f`) para o `SWAP` para proteger o lixo acumulado (`1.0f`).
-4. **O que a `v1.2.0` faz para corrigir:**
-   - **Monitora o `SWAP` (`nonLocalUsageBytes`) em tempo real** via `Engine.Platform.getGPUAdaptersInfo()`, zerando backoffs quando o SWAP cai.
-   - **Mantém folga preventiva na VRAM:** reduz `$gfx::transientPoolBudgetMB` para **`256 MB`**, reduz a limpeza em pausa para **`64%`**, cria **guarda de contração do WDDM** (`≥ 78%` quando `budgetMB < 87%` da VRAM física), cria **guarda de crescimento do SWAP** (`≥ 640 MB` ou pressão combinada `≥ 86%`) e aciona **limpeza no 1º pulso a partir de `1032 MB` de `SWAP`** (`0x140F0EEA3`).
-   - **Limpeza pós-carregamento e pós-ajuste gráfico:** limpa listas de staging acumuladas após `10 s` do fim do spawn de mapa/tráfego e `2 s` após alterações de configurações gráficas.
+Ao mesmo tempo, os próprios logs provaram que limpar **apenas quando a VRAM está realmente alta (`≥ 78%` do orçamento VMA junto com `SWAP >= 1032 MB`)** aciona um **`waitIdle()` limpo no 1º pulso** (`0x140F0EEA3`) e recupera **`1.520–1.796 MB` de VRAM vazada por limpeza**, evitando o platô de `~78%–84%`.
 
-### Marco Anterior (`v1.1.0` — Alinhamento com Orçamento VMA)
+### O que a `v1.2.1` corrige:
+1. **Exige VRAM elevada na limpeza assistida por SWAP:** `swap_assisted_vram_pressure` só dispara quando **`SWAP >= 1032 MB` E `VMA >= 78,0%`** (além do `vram_pressure` padrão em **`VMA >= 85,2%`**). Com VRAM saudável (`< 78%`), o mod fica 100% ocioso independentemente do tráfego normal de staging no `SWAP`.
+2. **Restaura `$gfx::transientPoolBudgetMB = 384 MB` e limpeza em pausa em `72%`:** volta aos valores estáveis e sem crashes da `v1.1.0` (`384 MB` e `72%` em pausa), evitando recriação excessiva de render targets.
+3. **Validação estrita apenas por VRAM e pulsos de 1 toque:** só considera a limpeza efetiva se pelo menos **`192 MB` de VRAM** forem liberados (ignorando flutuações de staging no `SWAP`); trava o disparo em **1 pulso** quando `VMA >= 85,2%` ou `SWAP >= 1032 MB`; aumenta o cooldown ativo para **`15 s`** (backoff de `30 s → 90 s`, carência de **`15 s`** pós-carregamento e **`5 s`** após mudar gráficos); e remove os gatilhos agressivos sob VRAM baixa (`swap_growth_preventive`, `wddm_budget_contraction`, `paused_swap_cleanup`, `post_mission_swap_cleanup`, `post_settings_cleanup`).
 
-- O disassembly de `GFXVkDevice::getMemoryInfo` (`0x140EFBA40`) mostrou que `availableBytes = max(0, budgetBytes - usageBytes)` em vez de `dedicatedBytes - usageBytes`. Disparamos em `usageBytes / budgetBytes >= 0.852` garantindo limpezas no **1º pulso** em `~198–260 ms` (`16/16` em Itália e `9/9` em perseguições de West Coast USA recuperando `18,5 GB` com `0` erros de fence).
+### Descobertas Anteriores (`v1.2.0` e `v1.1.0`)
+
+- **Visibilidade de `SWAP` não-local (`0x140EFA680` → `0x140EF7C90`):** `Engine.Render.getMemoryInfo()` (`0x140EFBA40`) zera `sharedBytes = 0` em GPUs dedicadas, enquanto `Engine.Platform.getGPUAdaptersInfo()` consulta `VK_EXT_memory_budget` (`nonLocalUsageBytes` / `nonLocalBudgetBytes`). Em `0x140F0EEA3`, `checkVmaHeapBudgets` autoriza limpeza no 1º pulso quando `nonLocalUsageBytes >= 1 GiB`.
+- **Callback OOM vazio e inversão de prioridade:** `vku::GenericBuffer` (`0x140EE42DD`) e `vku::GenericImage::create` (`0x14037E22C`) têm callback OOM vazio (`0x1401035E0 = ret 0`), e `VK_EXT_memory_priority` dá `1.0f` a render targets vs `0.75f` ao mapa/texturas — exigindo manter a VRAM abaixo de ~78–85% para o Windows WDDM não empurrar o mapa (`0.75f`) para a RAM via PCIe (`Heap 2`).
+- **Alinhamento com orçamento VMA (`v1.1.0`):** `GFXVkDevice::getMemoryInfo` reporta `availableBytes = max(0, budgetBytes - usageBytes)`. Alinhar em `usageBytes / budgetBytes >= 0.852` garante limpeza no 1º pulso em `~198–260 ms`.
 
 ---
 
 ## O que Este Mod Faz
 
-1. **Reduz `$gfx::transientPoolBudgetMB` de `1536 MB` para `256 MB`** no Vulkan (reaplicado automaticamente ao iniciar mapa ou alterar gráficos, sem mexer em nenhuma opção visual do jogador).
+1. **Reduz `$gfx::transientPoolBudgetMB` de `1536 MB` para `384 MB`** no Vulkan (reaplicado automaticamente ao iniciar mapa ou alterar gráficos, sem mexer em nenhuma opção visual do jogador).
 2. **Monitora VRAM e `SWAP` (memória GPU não-local)** via `Engine.Render.getMemoryInfo()` e `Engine.Platform.getGPUAdaptersInfo()`, chamando `Canvas:repaintUIThrottled()` com segurança fora do passe de renderização (`onUpdate`):
-   - **Pressão de VMA (`≥ 85,2%` de `budgetBytes`)** ou **teto de `SWAP` (`≥ 1032 MB`)**: aciona `checkVmaHeapBudgets` no **1º pulso (~200–260 ms)**.
-   - **Contração de orçamento do WDDM (`≥ 78%` com orçamento `< 87%` da VRAM física)** e **crescimento de `SWAP` (`≥ 640 MB`, +160 MB sobre o piso)**: executa preventivamente o ciclo de 5 pulsos (`~250 ms`) antes que o Windows expulse o mapa para a RAM via PCIe.
-   - **Em pausa:** faz limpeza oportunista a partir de **`≥ 64%` do orçamento VMA** ou **`SWAP ≥ 512 MB`** (+128 MB sobre o piso).
-   - **Pós-carregamento e pós-configurações:** esvazia buffers de staging residuais `10 s` após terminar de carregar o mapa/tráfego e `2 s` após mudanças de qualidade gráfica.
-   - **Proteção anti-loop e piso de SWAP:** se a memória estiver legitimamente ocupada por assets estáticos (`< 192 MB` VRAM e `< 128 MB` SWAP liberados), aumenta o intervalo automaticamente (`25 s → 90 s` VRAM, `30 s → 120 s` SWAP) e recalibra o piso do SWAP.
+   - **Pressão padrão de VMA (`≥ 85,2%` de `budgetBytes`):** aciona `checkVmaHeapBudgets(0.85f)` em **1 único pulso** (`~200–285 ms`).
+   - **Pressão de VMA assistida por SWAP (`≥ 78,0%` VMA com `SWAP ≥ 1032 MB`):** aproveita o limiar de `1 GiB` do C++ (`0x140F0EEA3`) para limpar em **1 pulso** antes que o platô de `~78%–84%` empurre assets do mapa para o `SWAP`.
+   - **Em pausa:** faz limpeza oportunista apenas quando **`VMA ≥ 72,0%`**.
+   - **Cooldowns de segurança e proteção anti-loop:** impõe intervalo mínimo de **`15 s`** após limpezas (**`15 s`** pós-carregamento de mapa e **`5 s`** após mudar gráficos) para não interromper uploads do `transferAcc`; se recuperar `< 192 MB` de VRAM, recua (`30 s → 90 s`).
 
 ### Telemetria Comprovada (`beamng.2.log` e `beamng.1.log` — Citybus + 7 Veículos, RX 580 8 GB Vulkan)
 
 - **Itália (37 min, `beamng.2.log`):** **16 limpezas automáticas sem falhas**, recuperando **1.972–2.147 MB por limpeza** e **0** erros `Failed to wait for fences`.
 - **West Coast USA com perseguição policial (17 min, `beamng.1.log`):** **9/9 limpezas no 1º pulso (`206–285 ms`)**, recuperando **18.528 MB (~18,5 GB)** sob pressão de `~120 MB/s` em perseguição, com piso estável em `4.040 MB` e **0** erros de fence ou `VK_ERROR_DEVICE_LOST`.
+- **Verificação da limpeza assistida por SWAP (logs `v1.2.x` em West Coast USA):** limpezas em 1 pulso disparadas em `78%–80%` de VMA com `SWAP >= 1.032 MB` recuperaram consistentemente **`1.520–1.796 MB` de VRAM** em um único pulso (`~290–305 ms`).
 
 ---
 
@@ -94,7 +95,7 @@ Abra o console (`~` ou `'`), selecione o modo **BeamNG - Lua / GE** e use:
 | :--- | :--- |
 | `vulkanVramFix.status()` | Mostra versão, % do orçamento VMA, VRAM física, uso de SWAP não-local, `$gfx::transientPoolBudgetMB`, total de limpezas, MB recuperados e status do streaming de texturas. |
 | `vulkanVramFix.flushNow()` | Executa uma limpeza imediata dos pools Vulkan na hora. |
-| `vulkanVramFix.setBudgetMB(256)` | Ajusta o `$gfx::transientPoolBudgetMB` (`128`–`2048` MB; padrão `256`). Útil em placas com 12 GB+ de VRAM. |
+| `vulkanVramFix.setBudgetMB(384)` | Ajusta o `$gfx::transientPoolBudgetMB` (`128`–`2048` MB; padrão `384`). Útil em placas com 12 GB+ de VRAM. |
 | `vulkanVramFix.setAutoFlush(false)` | Desativa temporariamente a limpeza automática (`true` para reativar). |
 
 ---
@@ -115,7 +116,7 @@ cmd /c "set DISABLE_VULKAN_OBS_CAPTURE=1& set EOS_OVERLAY_DISABLE_VULKAN_WIN64=1
 ## Observações e Limitações Conhecidas
 
 - A chamada a `Canvas:repaintUIThrottled()` pode causar uma piscada bem rápida (~1 frame) no instante em que uma limpeza de VRAM ou SWAP é executada.
-- Pela especificação do Vulkan, quando um buffer ou textura já foi alocado na RAM via PCIe (`SWAP`), ele não pode ser migrado de volta para a VRAM sem recarregar. A `v1.2.0` atua preventivamente mantendo folga na VRAM e limpando slabs de staging/voláteis antes que o WDDM empurre partes do mapa para o `SWAP`.
+- Pela especificação do Vulkan, quando um buffer ou textura já foi alocado na RAM via PCIe (`SWAP`), ele não pode ser migrado de volta para a VRAM sem recarregar. A `v1.2.1` mantém folga na VRAM abaixo dos limiares de despejo sem interromper o tráfego ativo de staging no `SWAP` quando a VRAM está baixa.
 - Testado no **BeamNG.drive v0.40.6.0**. Atualizações futuras do jogo podem corrigir a limpeza dos pools Vulkan nativamente na engine.
 
 ---
