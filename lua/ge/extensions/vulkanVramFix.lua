@@ -1,4 +1,4 @@
--- BeamNG.drive Vulkan VRAM Leak Fix (vulkanVramFix v1.3.0)
+-- BeamNG.drive Vulkan VRAM Leak Fix (vulkanVramFix v1.3.1)
 -- Non-destructive user-folder extension (does not alter original game files or user graphics settings).
 -- Works on AMD, NVIDIA, and Intel GPUs under Vulkan; stays inactive on DirectX 11 / DirectX 12.
 --
@@ -23,17 +23,15 @@
 --      below 85% VMA, preventing the ~78%-84% VRAM plateau where WDDM spills static map geometry
 --      into slow PCIe RAM, while refusing to flush at low VRAM (< 78% at speed) to prevent
 --      transferAcc->queue.submit VK_ERROR_DEVICE_LOST crashes.
---   6. v1.3.0 Smooth Opportunistic Flushing & Reduced Stutter:
---      - Lazy SWAP polling: GFXVkDevice::getGPUAdaptersInfo() calls vkEnumeratePhysicalDevices on
---        every invocation, so v1.3.0 skips it completely while VMA < 68% and only queries every 4s
---        in the pressure zone.
---      - Deferred post-flush verification (0.50s & >= 12 frames) so vkEnumeratePhysicalDevices never
---        runs on the first recovery frame while VMA is rebuilding working slabs after waitIdle().
---      - 4-Tier Smooth Scheduling: hides the unavoidable waitIdleAndFreeResources() pause inside
---        invisible UI/menu windows (pause, radial menu, BigMap, non-play routes, focus regain),
---        vehicle reset/switch cuts, and stationary stops (bus stops / red lights), and uses a 20s
---        soft-deferral window (78% -> 83.5% VMA) during high-speed driving to wait for a slowdown,
---        camera cut, or menu open before forcing a flush at the hard safety ceiling.
+--   6. v1.3.0 / v1.3.1 Smooth Opportunistic Flushing & Forensic Refinements:
+--      - Lazy SWAP polling with rising-edge refresh at 68% VMA (skips vkEnumeratePhysicalDevices
+--        when VMA < 68%, unfocused, or loading).
+--      - Deferred post-flush verification (0.50s & >= 12 frames) with clean loading/mission abort.
+--      - 4-Tier Smooth Scheduling with explicit UI menu whitelist (excludes active gameplay routes
+--        like taxi/trackBuilder/splitScreen, Photo Mode, and World Editor), 1-tap-only Radial Menu
+--        guard, bidirectional vramFloorMB recalibration, 2-sample stationary confirmation, 3s vehicle
+--        spawn protection window (transferAcc safety), 33.3ms UI-throttle retry guard, and
+--        zero-allocation pcall invocations for LuaJIT.
 
 local M = {}
 
@@ -42,7 +40,7 @@ local BYTES_PER_MB = 1024 * 1024
 local BYTES_PER_GB = 1024 * 1024 * 1024
 
 local config = {
-  version = "1.3.0",
+  version = "1.3.1",
   enabled = true,
   autoFlush = true,
   transientPoolBudgetMB = 384,          -- Vanilla default is 1536 MB; 384 MB avoids RT churn
@@ -55,15 +53,17 @@ local config = {
   menuFallbackVmaRatio = 0.72,          -- Threshold if vramFloorMB is not yet calibrated
   menuMinGainMB = 550,                  -- Required MB above observed VRAM floor
 
-  -- Tier 2: Vehicle Reset / Switch / Camera Cut windows
+  -- Tier 2: Vehicle Reset / Switch / Camera Cut & Spawn Grace windows
   eventCutVmaBudgetRatio = 0.68,        -- Clean inside player reset / vehicle switch cut
   eventCutMinGainMB = 650,
   cameraCutWindowSec = 1.25,            -- Must exceed checkIntervalSec so the next tick sees it
   uiPollIntervalSec = 0.25,             -- Check focus/menu transitions at 4 Hz (low overhead)
+  spawnGraceSec = 3.0,                  -- Block opportunistic flushes while new vehicle uploads via transferAcc
 
   -- Tier 3: Stationary / Stopped vehicle (bus stops, red lights, parked)
   stoppedSpeedMaxMS = 0.80,             -- <= ~2.9 km/h counts as stopped
-  stoppedMinHoldSec = 1.0,              -- Must stay stopped >= 1s (ignores brief bumps/wheelspin)
+  stoppedMinHoldSec = 1.0,              -- Must stay stopped >= 1s
+  stoppedMinSamples = 2,                -- Require >= 2 consecutive stationary samples
   stoppedVmaBudgetRatio = 0.72,         -- 1-tap clean while stationary if SWAP >= 1032 MB
   stoppedMinGainMB = 800,
 
@@ -78,13 +78,16 @@ local config = {
   activeFallbackUsedRatio = 0.78,       -- Fallback ratio only when budgetBytes is unavailable
   activeMinPhysicalFreeGB = 1.60,       -- Physical VRAM safety floor in GiB
 
-  -- Effectiveness, cooldowns & deferred verification
+  -- Effectiveness, throttle retry, cooldowns & deferred verification
   minReclaimedMB = 192,                 -- Strict VRAM-only effectiveness check (MB)
+  throttleDetectMs = 8,                 -- < 8ms means GuiCanvas::repaintUIThrottled skipped via 1/30s gate
+  throttleRetryDelaySec = 0.06,         -- Retry 1-tap flush once after 60ms (> 33.3ms gate)
+  minValidFlushMs = 15,                 -- Confirms waitIdleAndFreeResources() actually ran for floor recalibration
   normalCooldownSec = 15.0,             -- Cooldown after an effective flush so transferAcc settles
   backoffCooldownSec = 30.0,            -- Cooldown if VRAM is genuinely filled by static scene assets
   maxBackoffSec = 90.0,
   missionGraceSec = 15.0,               -- Grace period after mission load
-  settingsGraceSec = 5.0,               -- Grace period after graphics settings change
+  settingsGraceSec = 5.0,               -- Grace period after graphics settings change / level end
   burstStepSec = 0.05,                  -- Must exceed repaintUIThrottled's 1/30s (0.0333s) throttle
   maxBurstTaps = 5,                     -- Forces C++ checkVmaHeapBudgets 5-call bypass when needed
   verifyDelaySec = 0.50,                -- Defer post-flush getGPUAdaptersInfo() until frames recover
@@ -98,19 +101,24 @@ local state = {
   cooldownTimer = 0,
   currentBackoff = config.backoffCooldownSec,
   swapPollTick = 0,
+  wasInSwapZone = false,
   cachedSwap = nil,
   vramFloorMB = 0,
   wasFocused = true,
   wasInMenu = false,
   uiPollTimer = 0,
   stoppedTime = 0,
+  stoppedSamples = 0,
+  spawnGraceTimer = 0,
   softDeferTimer = 0,
   softDeferActive = false,
   recentCameraSwitchTimer = 0,
+  hasTimingApi = false,
   burstActive = false,
   burstTapsDone = 0,
   burstMaxTaps = config.maxBurstTaps,
   burstStepTimer = 0,
+  burstRetryUsed = false,
   burstPreUsedMB = 0,
   burstPreSwapMB = 0,
   burstFlushMs = 0,
@@ -167,52 +175,92 @@ local function isLoadingInProgress()
   return false
 end
 
+local function isEditorOpen()
+  if Engine and Engine.getEditorEnabled then
+    local ok, enabled = pcall(Engine.getEditorEnabled)
+    if ok and enabled then
+      return true
+    end
+  end
+  if type(editor) == "table" and editor.active == true then
+    return true
+  end
+  return false
+end
+
 local function isInInvisibleMenuWindow()
+  -- World Editor keeps full 3D scene rendering live; never treat it as an invisible menu
+  if isEditorOpen() then
+    return false, nil, false
+  end
+
+  local routeName = nil
+  local uiRouter = (extensions and extensions.ui_router) or ui_router
+  if uiRouter and uiRouter.getCurrent then
+    local ok, cur = pcall(uiRouter.getCurrent)
+    if ok and type(cur) == "table" then
+      routeName = (type(cur.resolved) == "table" and cur.resolved.name)
+        or (type(cur.request) == "table" and cur.request.name)
+    end
+  end
+
+  -- Photo Mode (pause.photomode) & Radial Mirrors preview keep the 3D scene front-and-center
+  if type(routeName) == "string" then
+    if string.find(string.lower(routeName), "photomode", 1, true) or routeName == "radial.mirrors" then
+      return false, nil, false
+    end
+  end
+
+  -- Full-screen / paused invisible windows (allow multi-tap bursts cleanly out of sight)
   if simTimeAuthority and simTimeAuthority.getPause then
     local ok, paused = pcall(simTimeAuthority.getPause)
     if ok and paused then
-      return true, "paused"
-    end
-  end
-  if core_quickAccess and core_quickAccess.isEnabled then
-    local ok, open = pcall(core_quickAccess.isEnabled)
-    if ok and open then
-      return true, "radial_menu"
+      return true, "paused", true
     end
   end
   if freeroam_bigMapMode and freeroam_bigMapMode.bigMapActive then
     local ok, active = pcall(freeroam_bigMapMode.bigMapActive)
     if ok and active then
-      return true, "bigmap"
+      return true, "bigmap", true
     end
   end
-  local uiRouter = (extensions and extensions.ui_router) or ui_router
-  if uiRouter and uiRouter.getCurrent then
-    local ok, cur = pcall(uiRouter.getCurrent)
-    if ok and type(cur) == "table" then
-      local routeName = (type(cur.request) == "table" and cur.request.name)
-        or (type(cur.resolved) == "table" and cur.resolved.name)
-      if type(routeName) == "string" and routeName ~= "" and routeName ~= "play" then
-        return true, "ui_menu"
-      end
+  if type(routeName) == "string" and routeName ~= "" then
+    if routeName == "menu" or string.sub(routeName, 1, 5) == "menu." then
+      return true, "main_menu", true
+    end
+    if routeName == "pause" or string.sub(routeName, 1, 6) == "pause." then
+      return true, "pause_menu", true
+    end
+    if routeName == "scenario.end" or routeName == "scenario.quickrace.end"
+      or (string.sub(routeName, 1, 9) == "scenario." and string.sub(routeName, -4) == ".end") then
+      return true, "scenario_end", true
     end
   end
-  return false, nil
+
+  -- Unpaused semi-transparent Radial Menu: strictly allow 1-tap only (never 5-tap flashes over 3D view)
+  if core_quickAccess and core_quickAccess.isEnabled then
+    local ok, open = pcall(core_quickAccess.isEnabled)
+    if ok and open then
+      return true, "radial_menu", false
+    end
+  end
+
+  return false, nil, false
 end
 
 local function getPlayerSpeedMS()
   local veh = nil
   if be and be.getPlayerVehicle then
-    local ok, v = pcall(function() return be:getPlayerVehicle(0) end)
+    local ok, v = pcall(be.getPlayerVehicle, be, 0)
     if ok then veh = v end
   elseif getPlayerVehicle then
     local ok, v = pcall(getPlayerVehicle, 0)
     if ok then veh = v end
   end
   if veh and veh.getVelocity then
-    local ok, vel = pcall(function() return veh:getVelocity() end)
+    local ok, vel = pcall(veh.getVelocity, veh)
     if ok and vel and vel.length then
-      local okLen, spd = pcall(function() return vel:length() end)
+      local okLen, spd = pcall(vel.length, vel)
       if okLen and type(spd) == "number" then
         return spd
       end
@@ -223,7 +271,7 @@ end
 
 local function getPlayerVehicleIdSafe()
   if be and be.getPlayerVehicleID then
-    local ok, vid = pcall(function() return be:getPlayerVehicleID(0) end)
+    local ok, vid = pcall(be.getPlayerVehicleID, be, 0)
     if ok and type(vid) == "number" then
       return vid
     end
@@ -288,7 +336,7 @@ local function readNonLocalSwap(dedicatedBytesHint)
 end
 
 local function readGpuMemory(swapMode)
-  -- swapMode: "force" = query getGPUAdaptersInfo now; "lazy" = only if VMA >= 68% & interval elapsed; "none" = skip query (use cache)
+  -- swapMode: "force" = query getGPUAdaptersInfo now; "lazy" = only if VMA >= 68% & interval/edge; "none" = cache only
   if not (Engine and Engine.Render and Engine.Render.getMemoryInfo) then
     return nil
   end
@@ -337,10 +385,18 @@ local function readGpuMemory(swapMode)
     local shouldRefreshSwap = false
     if mode == "force" then
       shouldRefreshSwap = true
-    elseif mode == "lazy" and vmaBudgetRatio >= config.swapPollMinVmaRatio then
-      state.swapPollTick = state.swapPollTick + 1
-      if state.cachedSwap == nil or state.swapPollTick >= config.swapCheckEveryNTicks then
-        shouldRefreshSwap = true
+      state.wasInSwapZone = (vmaBudgetRatio >= config.swapPollMinVmaRatio)
+    elseif mode == "lazy" then
+      if vmaBudgetRatio < config.swapPollMinVmaRatio then
+        state.wasInSwapZone = false
+        state.swapPollTick = 0
+      elseif isProgramFocused() and not isLoadingInProgress() then
+        local risingEdge = not state.wasInSwapZone
+        state.wasInSwapZone = true
+        state.swapPollTick = state.swapPollTick + 1
+        if risingEdge or state.cachedSwap == nil or state.swapPollTick >= config.swapCheckEveryNTicks then
+          shouldRefreshSwap = true
+        end
       end
     end
     if shouldRefreshSwap then
@@ -382,11 +438,16 @@ local function readGpuMemory(swapMode)
   }
 end
 
-local function updateVramFloor(usedMB)
+local function lowerVramFloorIfNeeded(usedMB)
   if type(usedMB) ~= "number" or usedMB <= 0 then return end
   if state.vramFloorMB <= 0 or usedMB < state.vramFloorMB then
     state.vramFloorMB = usedMB
   end
+end
+
+local function recalibrateVramFloorAfterFlush(usedMB)
+  if type(usedMB) ~= "number" or usedMB <= 0 then return end
+  state.vramFloorMB = usedMB
 end
 
 local function getEstimatedReclaimableMB(mem)
@@ -408,6 +469,22 @@ local function formatMemSummary(mem)
     return string.format("%s | SWAP %.0f MB", base, mem.swapUsedMB)
   end
   return base
+end
+
+local function resetPendingFlushState()
+  state.burstActive = false
+  state.burstTapsDone = 0
+  state.burstStepTimer = 0
+  state.burstRetryUsed = false
+  state.burstFlushMs = 0
+  state.verifyPending = false
+  state.verifyTimer = 0
+  state.verifyFramesLeft = 0
+  state.stoppedTime = 0
+  state.stoppedSamples = 0
+  state.softDeferTimer = 0
+  state.softDeferActive = false
+  state.recentCameraSwitchTimer = 0
 end
 
 local function isSafeToFlush()
@@ -443,6 +520,7 @@ local function startFlushBurst(reason, mem, maxTaps)
   state.burstTapsDone = 0
   state.burstMaxTaps = resolvedMaxTaps
   state.burstStepTimer = 0
+  state.burstRetryUsed = false
   state.burstFlushMs = 0
   state.verifyPending = false
   state.verifyTimer = 0
@@ -477,7 +555,7 @@ local function recordEffectiveFlush(curMem, tapCount)
   state.cooldownTimer = config.normalCooldownSec
 
   if curMem then
-    updateVramFloor(curMem.usedMB)
+    recalibrateVramFloorAfterFlush(curMem.usedMB)
   end
 
   local msStr = state.burstFlushMs > 0 and string.format(" in %.0fms", state.burstFlushMs) or ""
@@ -506,7 +584,7 @@ local function stepBurst(dtReal)
       return true
     end
 
-    -- For multi-tap bursts (> 1), do a fast VMA-only check (no getGPUAdaptersInfo) to stop early if already reclaimed
+    -- For multi-tap bursts (> 1), do a fast VMA-only check to stop early if already reclaimed
     if state.burstTapsDone > 0 and state.burstMaxTaps > 1 then
       local curMem = readGpuMemory("none")
       if curMem then
@@ -530,10 +608,12 @@ local function stepBurst(dtReal)
     end
 
     local t0 = getSystemTimeMS()
-    local ok, err = pcall(function() canvas:repaintUIThrottled() end)
+    local ok, err = pcall(canvas.repaintUIThrottled, canvas)
     local t1 = getSystemTimeMS()
+    local tapMs = nil
     if t0 and t1 and t1 >= t0 then
-      state.burstFlushMs = state.burstFlushMs + (t1 - t0)
+      state.hasTimingApi = true
+      tapMs = t1 - t0
     end
 
     if not ok then
@@ -541,6 +621,17 @@ local function stepBurst(dtReal)
       state.burstActive = false
       state.cooldownTimer = config.backoffCooldownSec
       return true
+    end
+
+    -- Detect silent C++ 1/30s (33.3ms) UI throttle no-op on 1-tap flushes and retry once after 60ms
+    if state.burstMaxTaps == 1 and tapMs ~= nil and tapMs < config.throttleDetectMs and not state.burstRetryUsed then
+      state.burstRetryUsed = true
+      state.burstStepTimer = config.throttleRetryDelaySec
+      return true
+    end
+
+    if tapMs then
+      state.burstFlushMs = state.burstFlushMs + tapMs
     end
 
     state.burstTapsDone = state.burstTapsDone + 1
@@ -557,6 +648,12 @@ local function stepBurst(dtReal)
   end
 
   if state.verifyPending then
+    if not state.isVulkan or isLoadingInProgress() then
+      state.verifyPending = false
+      state.verifyFramesLeft = 0
+      return false
+    end
+
     state.verifyTimer = state.verifyTimer - dtReal
     if state.verifyFramesLeft > 0 then
       state.verifyFramesLeft = state.verifyFramesLeft - 1
@@ -580,6 +677,13 @@ local function stepBurst(dtReal)
       state.cooldownTimer = state.currentBackoff
       state.currentBackoff = math.min(config.maxBackoffSec, state.currentBackoff * 1.5)
 
+      -- If waitIdleAndFreeResources genuinely ran, recalibrate floor upward for current active traffic/scene
+      local waitIdleRan = (state.burstFlushMs >= config.minValidFlushMs)
+        or (not state.hasTimingApi and (state.burstMaxTaps == 1 or state.burstTapsDone >= config.maxBurstTaps))
+      if waitIdleRan and curMem then
+        recalibrateVramFloorAfterFlush(curMem.usedMB)
+      end
+
       log("I", logTag, string.format(
         "Vulkan pool flush reclaimed only %.0f MB VRAM / %.0f MB SWAP (now %s); backing off for %.0fs",
         vramDelta, swapDelta, formatMemSummary(curMem), state.cooldownTimer
@@ -593,7 +697,9 @@ end
 
 local function tryEventCutFlush(reason)
   if not config.enabled or not config.autoFlush or not state.isVulkan then return false end
-  if state.burstActive or state.verifyPending or state.cooldownTimer > 0 then return false end
+  if state.burstActive or state.verifyPending or state.cooldownTimer > 0 or state.spawnGraceTimer > 0 then
+    return false
+  end
   if not isSafeToFlush() then return false end
 
   local mem = readGpuMemory("none")
@@ -608,7 +714,7 @@ local function tryEventCutFlush(reason)
   -- Refresh SWAP right before starting so we know whether C++ guarantees a 1-tap flush
   local fullMem = readGpuMemory("force") or mem
   local fullRatio = fullMem.hasExactBudget and fullMem.vmaBudgetRatio or fullMem.usedRatio
-  local hasOneTap = (fullMem.hasExactBudget and fullRatio >= 0.852)
+  local hasOneTap = (fullMem.hasExactBudget and fullRatio >= config.activeVmaBudgetRatio)
     or (fullMem.isDedicated and fullMem.hasSwapInfo and fullMem.swapUsedMB >= config.activeSwapHardMB)
   if hasOneTap then
     return startFlushBurst(reason, fullMem, 1)
@@ -623,6 +729,9 @@ local function onUpdate(dtReal, dtSim, dtRaw)
 
   if state.recentCameraSwitchTimer > 0 then
     state.recentCameraSwitchTimer = math.max(0, state.recentCameraSwitchTimer - dt)
+  end
+  if state.spawnGraceTimer > 0 then
+    state.spawnGraceTimer = math.max(0, state.spawnGraceTimer - dt)
   end
 
   if stepBurst(dt) then return end
@@ -662,7 +771,7 @@ local function onUpdate(dtReal, dtSim, dtRaw)
   if not state.loggedFirstSample then
     state.loggedFirstSample = true
     if mem.vmaBudgetRatio < 0.70 then
-      updateVramFloor(mem.usedMB)
+      lowerVramFloorIfNeeded(mem.usedMB)
     end
     local swapStr = mem.hasSwapInfo
       and string.format(", SWAP=%.0f/%.0f MB, nonLocalUsage=%s, nonLocalBudget=%s",
@@ -677,15 +786,26 @@ local function onUpdate(dtReal, dtSim, dtRaw)
       tostring(mem.raw.dedicatedBytes), tostring(mem.raw.budgetBytes),
       tostring(mem.raw.usageBytes), tostring(mem.raw.availableBytes)
     ))
+  else
+    lowerVramFloorIfNeeded(mem.usedMB)
   end
 
-  local inMenuNow, menuTag = isInInvisibleMenuWindow()
+  -- Avoid evaluating triggers or calling readGpuMemory("force") while Alt-Tabbed or loading
+  if not isSafeToFlush() then
+    return
+  end
+
+  local inMenuNow, menuTag, allowsMultiTap = isInInvisibleMenuWindow()
   local ratio = mem.hasExactBudget and mem.vmaBudgetRatio or mem.usedRatio
   local gainEst = getEstimatedReclaimableMB(mem)
 
   -- Tier 1: Invisible UI / Menu / Pause window (clean completely out of sight!)
   if inMenuNow then
     state.stoppedTime = 0
+    state.stoppedSamples = 0
+    if state.spawnGraceTimer > 0 then
+      return
+    end
     local menuReady = false
     if state.vramFloorMB > 0 then
       menuReady = (ratio >= config.menuVmaBudgetRatio and gainEst >= config.menuMinGainMB)
@@ -694,9 +814,15 @@ local function onUpdate(dtReal, dtSim, dtRaw)
       menuReady = (ratio >= config.menuFallbackVmaRatio)
     end
     if menuReady then
-      -- Refresh SWAP once right before starting so we pick 1-tap if SWAP >= 1032 MB
       local fullMem = readGpuMemory("force") or mem
-      startFlushBurst((menuTag or "menu") .. "_opportunistic", fullMem)
+      local fullRatio = fullMem.hasExactBudget and fullMem.vmaBudgetRatio or fullMem.usedRatio
+      local hasOneTap = (fullMem.hasExactBudget and fullRatio >= config.activeVmaBudgetRatio)
+        or (fullMem.isDedicated and fullMem.hasSwapInfo and fullMem.swapUsedMB >= config.activeSwapHardMB)
+      if hasOneTap then
+        startFlushBurst((menuTag or "menu") .. "_opportunistic", fullMem, 1)
+      elseif allowsMultiTap then
+        startFlushBurst((menuTag or "menu") .. "_opportunistic", fullMem, config.maxBurstTaps)
+      end
     end
     return
   end
@@ -706,22 +832,29 @@ local function onUpdate(dtReal, dtSim, dtRaw)
   if ratio >= config.stoppedVmaBudgetRatio then
     speedMS = getPlayerSpeedMS()
     if speedMS ~= nil and speedMS <= config.stoppedSpeedMaxMS then
+      state.stoppedSamples = state.stoppedSamples + 1
       state.stoppedTime = state.stoppedTime + elapsedSinceCheck
     else
+      state.stoppedSamples = 0
       state.stoppedTime = 0
     end
   else
+    state.stoppedSamples = 0
     state.stoppedTime = 0
   end
 
   -- Tier 3: Stationary / Stopped window (bus stop, red light, parked) -> 1-tap only!
-  if state.stoppedTime >= config.stoppedMinHoldSec and ratio >= config.stoppedVmaBudgetRatio
+  if state.spawnGraceTimer <= 0
+    and state.stoppedSamples >= config.stoppedMinSamples
+    and state.stoppedTime >= config.stoppedMinHoldSec
+    and ratio >= config.stoppedVmaBudgetRatio
     and (state.vramFloorMB <= 0 or gainEst >= config.stoppedMinGainMB or ratio >= config.activeSwapAssistedSoftRatio) then
     local checkMem = mem
     if checkMem.isDedicated and (not checkMem.hasSwapInfo or checkMem.swapUsedMB < config.activeSwapHardMB) and state.swapPollTick >= 2 then
       checkMem = readGpuMemory("force") or mem
     end
-    local hasOneTap = (checkMem.hasExactBudget and checkMem.vmaBudgetRatio >= config.activeVmaBudgetRatio)
+    local checkRatio = checkMem.hasExactBudget and checkMem.vmaBudgetRatio or checkMem.usedRatio
+    local hasOneTap = (checkMem.hasExactBudget and checkRatio >= config.activeVmaBudgetRatio)
       or (checkMem.isDedicated and checkMem.hasSwapInfo and checkMem.swapUsedMB >= config.activeSwapHardMB)
     if hasOneTap then
       startFlushBurst("stopped_opportunistic", checkMem, 1)
@@ -748,16 +881,18 @@ local function onUpdate(dtReal, dtSim, dtRaw)
       return
     end
 
-    -- Soft deferral zone (78.0% .. 83.5%): wait up to 20s for a slowdown, camera cut, or menu
+    -- Soft deferral zone (78.0% .. 83.5%): wait up to 20s for a slowdown or camera cut
     state.softDeferActive = true
-    local isSlow = (speedMS ~= nil and speedMS <= config.activeSlowSpeedMaxMS)
-    local isCamCut = (state.recentCameraSwitchTimer > 0)
-    if isSlow then
-      startFlushBurst("slowdown_opportunistic", mem, 1)
-      return
-    elseif isCamCut then
-      startFlushBurst("camera_cut_opportunistic", mem, 1)
-      return
+    if state.spawnGraceTimer <= 0 then
+      local isSlow = (speedMS ~= nil and speedMS <= config.activeSlowSpeedMaxMS)
+      local isCamCut = (state.recentCameraSwitchTimer > 0)
+      if isSlow then
+        startFlushBurst("slowdown_opportunistic", mem, 1)
+        return
+      elseif isCamCut then
+        startFlushBurst("camera_cut_opportunistic", mem, 1)
+        return
+      end
     end
 
     state.softDeferTimer = state.softDeferTimer + elapsedSinceCheck
@@ -786,6 +921,11 @@ local function onCameraModeChanged(camName)
   end
 end
 
+local function onVehicleSpawned(vid)
+  if not config.enabled or not state.isVulkan then return end
+  state.spawnGraceTimer = math.max(state.spawnGraceTimer, config.spawnGraceSec)
+end
+
 local function onVehicleResetted(vehicleID)
   local playerVid = getPlayerVehicleIdSafe()
   if playerVid and vehicleID == playerVid then
@@ -802,27 +942,39 @@ end
 local function onSettingsChanged()
   state.isVulkan = isVulkanBackend()
   applyTransientBudget()
+  resetPendingFlushState()
   state.currentBackoff = config.backoffCooldownSec
   state.cachedSwap = nil
+  state.wasInSwapZone = false
   state.vramFloorMB = 0
-  state.softDeferTimer = 0
-  state.softDeferActive = false
   state.cooldownTimer = config.settingsGraceSec
 end
 
 local function onClientStartMission()
   state.isVulkan = isVulkanBackend()
   applyTransientBudget()
+  resetPendingFlushState()
   state.loggedFirstSample = false
   state.currentBackoff = config.backoffCooldownSec
   state.cachedSwap = nil
+  state.wasInSwapZone = false
   state.vramFloorMB = 0
-  state.stoppedTime = 0
-  state.softDeferTimer = 0
-  state.softDeferActive = false
-  state.recentCameraSwitchTimer = 0
+  state.spawnGraceTimer = 0
   state.uiPollTimer = 0
   state.cooldownTimer = config.missionGraceSec
+end
+
+local function onClientEndMission(levelPath)
+  state.isVulkan = isVulkanBackend()
+  resetPendingFlushState()
+  state.loggedFirstSample = false
+  state.currentBackoff = config.backoffCooldownSec
+  state.cachedSwap = nil
+  state.wasInSwapZone = false
+  state.vramFloorMB = 0
+  state.spawnGraceTimer = 0
+  state.uiPollTimer = 0
+  state.cooldownTimer = config.settingsGraceSec
 end
 
 local function onExtensionLoaded()
@@ -832,7 +984,7 @@ local function onExtensionLoaded()
   state.isVulkan = isVulkanBackend()
   applyTransientBudget()
   log("I", logTag, string.format(
-    "Loaded v%s (backend=%s, transientPoolBudgetMB=%d, autoFlush=%s, menuVma=%.0f%%, stoppedVma=%.0f%%, softDeferVma=%.1f%%-%.1f%%, hardVma=%.1f%%, swapHard=%.0fMB, cooldown=%.0fs)",
+    "Loaded v%s (backend=%s, transientPoolBudgetMB=%d, autoFlush=%s, menuVma=%.0f%%, stoppedVma=%.0f%%, softDeferVma=%.1f%%-%.1f%%, hardVma=%.1f%%, swapHard=%.0fMB, spawnGrace=%.1fs, cooldown=%.0fs)",
     config.version,
     state.isVulkan and "Vulkan" or "non-Vulkan",
     config.transientPoolBudgetMB,
@@ -843,6 +995,7 @@ local function onExtensionLoaded()
     config.activeSwapAssistedHardRatio * 100,
     config.activeVmaBudgetRatio * 100,
     config.activeSwapHardMB,
+    config.spawnGraceSec,
     config.normalCooldownSec
   ))
 end
@@ -850,6 +1003,8 @@ end
 local function status()
   local mem = readGpuMemory("force")
   local curBudget = VariableRegistry and VariableRegistry.get and VariableRegistry.get("$gfx::transientPoolBudgetMB")
+  local inMenuNow, menuTag, allowsMultiTap = isInInvisibleMenuWindow()
+  local menuStr = inMenuNow and string.format("%s(multi=%s)", tostring(menuTag), tostring(allowsMultiTap)) or "false"
   local texStr = ""
   if Engine and Engine.Render and Engine.Render.getTextureStreamingStats then
     local ok, ts = pcall(Engine.Render.getTextureStreamingStats)
@@ -864,7 +1019,7 @@ local function status()
     end
   end
   local info = string.format(
-    "[vulkanVramFix v%s] vulkan=%s autoFlush=%s transientBudget=%sMB flushes=%d reclaimedVRAM=%.0fMB reclaimedSWAP=%.0fMB last=%.0f/%.0fMB(%.0fms,%s) vramFloor=%.0fMB | %s%s",
+    "[vulkanVramFix v%s] vulkan=%s autoFlush=%s transientBudget=%sMB flushes=%d reclaimedVRAM=%.0fMB reclaimedSWAP=%.0fMB last=%.0f/%.0fMB(%.0fms,%s) vramFloor=%.0fMB inMenu=%s stoppedSamples=%d softDefer=%s(%.1fs) spawnGrace=%.1fs | %s%s",
     config.version,
     tostring(state.isVulkan),
     tostring(config.autoFlush),
@@ -877,6 +1032,11 @@ local function status()
     state.lastFlushMs,
     state.lastFlushReason,
     state.vramFloorMB,
+    menuStr,
+    state.stoppedSamples,
+    tostring(state.softDeferActive),
+    state.softDeferTimer,
+    state.spawnGraceTimer,
     formatMemSummary(mem),
     texStr
   )
@@ -915,7 +1075,9 @@ end
 M.onExtensionLoaded = onExtensionLoaded
 M.onSettingsChanged = onSettingsChanged
 M.onClientStartMission = onClientStartMission
+M.onClientEndMission = onClientEndMission
 M.onCameraModeChanged = onCameraModeChanged
+M.onVehicleSpawned = onVehicleSpawned
 M.onVehicleResetted = onVehicleResetted
 M.onVehicleSwitched = onVehicleSwitched
 M.onUpdate = onUpdate

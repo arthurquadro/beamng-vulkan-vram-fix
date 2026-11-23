@@ -2,7 +2,7 @@
 
 > 🇧🇷 **Prefere ler em Português?** Veja [README.pt-BR.md](README.pt-BR.md).
 
-A lightweight, non-destructive **BeamNG.drive** mod (`v1.3.0`) that stops progressive **Vulkan VRAM memory leaks** and **high-VRAM spillover into slow system RAM ("SWAP")** — preventing VRAM saturation that causes severe FPS collapses (~10–14 FPS) or crashes, while scheduling cleanups inside invisible/low-motion windows to minimize stuttering.
+A lightweight, non-destructive **BeamNG.drive** mod (`v1.3.1`) that stops progressive **Vulkan VRAM memory leaks** and **high-VRAM spillover into slow system RAM ("SWAP")** — preventing VRAM saturation that causes severe FPS collapses (~10–14 FPS) or crashes, while scheduling cleanups inside invisible/low-motion windows to minimize stuttering.
 
 - **Works with any vehicle and any map** — does not overwrite any vehicle or game files.
 - **Works on AMD, NVIDIA, and Intel GPUs** (Vulkan backend only; automatically stays idle on DirectX 11 / DirectX 12).
@@ -21,20 +21,20 @@ Binary analysis of `BeamNG.drive.x64.exe` (`v0.40.6.0`) revealed why VRAM climbs
 
 ---
 
-## What Changed in `v1.3.0` (Smooth Opportunistic Flushing & Reduced Stuttering)
+## What Changed in `v1.3.1` (Forensic Audit Refinements & Edge-Case Guards)
 
-Because BeamNG's Vulkan backend has no incremental pool trimmer (`GFXVkDevice::waitIdleAndFreeResources()` at `0x140F1A710` always stalls `mTransferQueue`/`mGraphicsQueue`/`mPresentQueue`, drains the ThreadPool, and presents `"maincef"` via `GuiCanvas::repaintUIThrottled()` — incurring a fixed `~190–250 ms` pause regardless of how many MB are freed), `v1.3.0` focuses on eliminating polling overhead and hiding cleanups where you never feel them:
+Building on `v1.3.0`'s 4-tier smooth opportunistic scheduler, `v1.3.1` hardens gameplay detection, floor tracking, GPU transfer safety, and LuaJIT execution overhead:
 
-1. **Lazy `SWAP` polling (eliminates `vkEnumeratePhysicalDevices` every 2s):** Disassembling `GFXVkDevice::getGPUAdaptersInfo()` (`0x140EFA680`) showed it calls `vkEnumeratePhysicalDevices` and re-queries all adapter properties on every call. `v1.3.0` skips it completely while `VMA < 68%` and polls at most every `4 s` once `VMA >= 68%`.
-2. **Deferred post-flush verification (`0.50 s` + `>= 12` smooth frames):** Stops calling `getGPUAdaptersInfo()` on the very first recovery frame after `waitIdle()` while VMA is rebuilding working slabs, removing the secondary post-flush hitch and logging exact flush duration (`in Xms`).
-3. **4-Tier Smooth Opportunistic Scheduling (with observed `vramFloorMB` tracking):**
-   - **Tier 1 — Invisible UI / Menu Windows (`≥ 64%` VMA & `≥ 550 MB` above floor):** Instantly catches pause menu, **Radial Menu** (`core_quickAccess`), **BigMap** (`freeroam_bigMapMode`), non-`"play"` UI routes, and Alt-Tab focus regain at 4 Hz so flushes happen completely out of sight.
-   - **Tier 2 — Event Cut Windows (`≥ 68%` VMA & `≥ 650 MB` above floor):** Hides 1-tap cleanups inside player vehicle resets (`onVehicleResetted`, ignoring AI traffic) and vehicle switches (`onVehicleSwitched`).
-   - **Tier 3 — Stationary / Stopped Windows (`≥ 72%` VMA & `≥ 800 MB` above floor):** When the player vehicle is stopped (`≤ 2.9 km/h` for `≥ 1 s`, e.g., red lights / bus stops / gas stations) and `SWAP ≥ 1032 MB`, cleans in 1 tap while stationary.
-   - **Tier 4 — Active Driving Soft-Deferral (`78.0% → 83.5%` VMA):** Instead of freezing mid-corner the instant `VMA` touches `78.0%` with `SWAP ≥ 1032 MB`, waits up to **`20 s`** for a slowdown (`≤ 12.6 km/h`), camera switch (`onCameraModeChanged`), or menu open — only forcing a 1-tap flush at **`83.5%`** VMA, **`SWAP ≥ 1700 MB`**, `20 s` expiry, or the **`85.2%`** hard VMA ceiling.
+1. **Explicit Menu Whitelist (`ui_router` + Photo Mode / World Editor exclusion):** Replaces the old `routeName ~= "play"` check with an explicit whitelist (`"menu"`, `"menu.*"`, `"pause"`, `"pause.*"`, `"scenario.end"`, `"scenario.*.end"`) while explicitly excluding Photo Mode (`pause.photomode`), Radial Mirrors (`radial.mirrors`), and the World Editor (`F11`). Driving routes such as Taxi (`"taxi"`), Track Builder (`"trackBuilder"`), and Split-Screen never mis-trigger menu cleanups anymore.
+2. **1-Tap-Only Unpaused Radial Menu:** Keeps semi-transparent unpaused Radial Menu (`core_quickAccess`) restricted to guaranteed **1-tap** cleanups (`SWAP >= 1032 MB` or `VMA >= 85.2%`), eliminating multi-tap flashes over live 3D rendering.
+3. **Bidirectional `vramFloorMB` Recalibration:** Recalibrates `vramFloorMB` both upward and downward whenever `waitIdleAndFreeResources()` genuinely runs (`>= 15 ms`), adapting cleanly as traffic/police groups or extra vehicles spawn and despawn without stale floor drift.
+4. **Silent `33.3 ms` UI-Throttle Detection & Single Retry:** Detects when `GuiCanvas::repaintUIThrottled()` (`0x140446383`) exits in `< 8 ms` due to the C++ `1/30 s` throttle gate and schedules 1 automatic retry `60 ms` later instead of wasting the flush and backing off.
+5. **2-Sample Stationary Confirmation & `3 s` Spawn Grace Window:** Requires `>= 2` consecutive stationary samples (`>= 1 s` hold) before `stopped_opportunistic` runs, and adds an `onVehicleSpawned` `3.0 s` grace window blocking opportunistic flushes while `transferAcc` streams a new vehicle's meshes and textures.
+6. **Clean Lifecycle & Rising-Edge `SWAP` Refresh:** Adds `onClientEndMission`, cancels pending bursts/verifications on level loading/settings changes, skips menu-trigger `getGPUAdaptersInfo()` polling while Alt-Tabbed, forces an immediate `SWAP` refresh on the `68%` VMA rising edge, and replaces all anonymous `pcall(function() ... end)` closures with zero-allocation `pcall(fn, self, ...)` calls plus `pcall`-guarded `modScript.lua`.
 
-### Earlier Milestones (`v1.2.1`, `v1.2.0` & `v1.1.0`)
+### Earlier Milestones (`v1.3.0`, `v1.2.1`, `v1.2.0` & `v1.1.0`)
 
+- **`v1.3.0` (Smooth Opportunistic Flushing):** Introduced lazy `SWAP` polling (`>= 68%` VMA, 4 s interval), deferred post-flush verification (`0.50 s` + `>= 12` frames), observed `vramFloorMB`, 4-tier scheduling (invisible UI/menu windows, reset/switch cuts, stationary stops, and `78.0% → 83.5%` active soft deferral up to `20 s` waiting for slowdowns or camera cuts).
 - **`v1.2.1` (`VK_ERROR_DEVICE_LOST` Hotfix):** Fixed `v1.2.0`'s low-VRAM `swap_pressure` loop (`transferAcc->queue.submit = VK_ERROR_DEVICE_LOST`) by requiring elevated VRAM (`≥ 78%`), strict VRAM-only reclaim validation (`≥ 192 MB`), 1-tap bursts when `VMA ≥ 85.2%` or `SWAP ≥ 1032 MB`, `15 s` cooldowns, and restoring `$gfx::transientPoolBudgetMB = 384 MB`. Verified in West Coast USA (`v1.2.1` `beamng.log`: 4/4 clean 1-tap flushes reclaiming `1,340–1,615 MB` VRAM each, `0` crashes).
 - **`v1.2.0` (`SWAP` Visibility):** Exposed `nonLocalUsageBytes` via `Engine.Platform.getGPUAdaptersInfo()` (`0x140EFA680`), leveraging C++'s `1 GiB` non-local 1-tap check (`0x140F0EEA3`) so map geometry (`priority = 0.75f`) isn't evicted into slow PCIe RAM (`Heap 2`) by WDDM.
 - **`v1.1.0` (VMA Budget Alignment):** Aligned the active threshold to `usageBytes / budgetBytes >= 0.852` matching `GFXVkDevice::getMemoryInfo` (`0x140EFBA40`) and `checkVmaHeapBudgets(0.85f)` (`0x140F0ED80`).
@@ -44,11 +44,11 @@ Because BeamNG's Vulkan backend has no incremental pool trimmer (`GFXVkDevice::w
 ## What This Mod Does
 
 1. **Caps `$gfx::transientPoolBudgetMB` from `1536 MB` to `384 MB`** on Vulkan (re-applied cleanly on mission start and graphics setting changes, without touching any visual menu option).
-2. **Monitors VRAM cleanly (and `SWAP` lazily only when `VMA ≥ 68%`)**, calling `Canvas:repaintUIThrottled()` safely outside the render pass (`onUpdate`) using 4-tier scheduling:
-   - **Invisible menus / pause / radial / BigMap:** cleans silently at **`≥ 64%` VMA** (`+550 MB` above floor).
-   - **Player reset / switch & stationary stops:** hides 1-tap flushes inside resets (`≥ 68%`) or stops (`≥ 72%`, `≤ 2.9 km/h`).
-   - **Active driving:** soft-defers **`78.0% → 83.5%`** (with `SWAP ≥ 1032 MB`) up to `20 s` waiting for a slowdown/camera cut/menu, with guaranteed **1-tap** hard ceilings at **`83.5%`** (with `SWAP ≥ 1032 MB`) or **`85.2%`** VMA.
-   - **Safety cooldowns & anti-loop backoff:** enforces **`15 s`** post-flush cooldown (**`15 s`** after map load, **`5 s`** after settings changes) and defers post-flush verification by `0.50 s` (`≥ 12` frames); if `< 192 MB` of VRAM is reclaimed, backs off (`30 s → 90 s`).
+2. **Monitors VRAM cleanly (zero-allocation `pcall`s, and `SWAP` lazily only when `VMA ≥ 68%` and focused)**, calling `Canvas:repaintUIThrottled()` safely outside the render pass (`onUpdate`) using 4-tier scheduling:
+   - **Invisible menus / pause / BigMap (and 1-tap Radial Menu):** cleans silently at **`≥ 64%` VMA** (`+550 MB` above recalibrated floor), excluding Photo Mode and World Editor.
+   - **Player reset / switch & stationary stops:** waits `3 s` after any vehicle spawn (`onVehicleSpawned`), and hides 1-tap flushes inside resets (`≥ 68%`) or confirmed 2-sample stops (`≥ 72%`, `≤ 2.9 km/h` for `≥ 1 s`).
+   - **Active driving:** soft-defers **`78.0% → 83.5%`** (with `SWAP ≥ 1032 MB`) up to `20 s` waiting for a slowdown/camera cut/menu, with guaranteed **1-tap** hard ceilings (plus 1 automatic `60 ms` retry if throttled by the `33.3 ms` UI gate) at **`83.5%`** (with `SWAP ≥ 1032 MB`) or **`85.2%`** VMA.
+   - **Safety cooldowns & anti-loop backoff:** enforces **`15 s`** post-flush cooldown (**`15 s`** after map load, **`5 s`** after settings changes / level end) and defers post-flush verification by `0.50 s` (`≥ 12` frames); if `< 192 MB` of VRAM is reclaimed, backs off (`30 s → 90 s`).
 
 ### Verified Telemetry (`beamng.2.log` & `beamng.1.log` — Citybus + 7 Traffic/Police Vehicles, RX 580 8 GB Vulkan)
 
@@ -117,7 +117,7 @@ cmd /c "set DISABLE_VULKAN_OBS_CAPTURE=1& set EOS_OVERLAY_DISABLE_VULKAN_WIN64=1
 ## Known Notes & Limitations
 
 - A flush executes `Canvas:repaintUIThrottled()`, which can cause a brief (~1 frame) visual blink at the moment a VRAM or SWAP cleanup runs.
-- By design in Vulkan, once a buffer or texture has already been bound to non-local system RAM (`SWAP`), it cannot be migrated back to VRAM in place. `v1.3.0` keeps VRAM headroom safely below eviction thresholds while hiding cleanups inside menu, reset, and stationary windows whenever possible.
+- - By design in Vulkan, once a buffer or texture has already been bound to non-local system RAM (`SWAP`), it cannot be migrated back to VRAM in place. `v1.3.1` keeps VRAM headroom safely below eviction thresholds while hiding cleanups inside verified menu, reset, and stationary windows whenever possible.
 - Tested on **BeamNG.drive v0.40.6.0**. Future BeamNG updates may fix the engine-side Vulkan pool trimming natively, making this workaround unnecessary.
 
 ---
